@@ -2,11 +2,6 @@
 // learn how to interface with and run code on the GPU, for the input size and
 // chosen implementation this algorithm would run more efficiently on the CPU.
 
-// WIP:
-// - Separate input / output buffers
-// - Define a work size of 10
-// - Do not hardcode work size. Pass in work size as uniform? Use dimensions?
-
 use std::borrow::Cow;
 
 use wgpu::util::DeviceExt;
