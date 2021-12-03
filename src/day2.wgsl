@@ -19,7 +19,7 @@ struct ItemsPerWorker {
 };
 
 [[binding(0), group(0)]]
-var<storage, read_write> v_movements: Input;
+var<storage, read> v_movements: Input;
 
 [[binding(1), group(0)]]
 var<storage, read_write> outputs: Output;

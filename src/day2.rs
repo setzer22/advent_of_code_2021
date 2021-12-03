@@ -134,7 +134,6 @@ async fn execute_gpu_inner(
         mapped_at_creation: false,
     });
 
-
     // This uniform buffer is just to send a single u32 value, with the
     // ITEMS_PER_WORKER constant.
     let items_per_worker_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -143,17 +142,9 @@ async fn execute_gpu_inner(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
-    // The compute pipeline. Describes which shader to run.
-    let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: None,
-        layout: None,
-        module: &cs_module,
-        entry_point: "main",
-    });
-
-    // This will introspect the shader code and generate an appropiate bind
-    // group layout automatically. The bind group layout can also be created
-    // manually, but then it needs to be kept in sync with the shader.
+    // There are two ways to define binding groups in wgpu. Implicitly or
+    // explicitly. Implicit mode will introspect the shader code and generate an
+    // appropiate bind group layout automatically.
     //
     // There are a few caveats when using this implicit API, though:
     //
@@ -161,8 +152,67 @@ async fn execute_gpu_inner(
     //   alone. You need to look into the shaders.
     // - The introspection does not look at declarations but *usages*. If a
     //   storage buffer or uniform is unused in the shader code, the bind group
-    //   layout returned will be incorrect.
-    let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
+    //   layout returned will be incorrect. let bind_group_layout =
+    //   compute_pipeline.get_bind_group_layout(0);
+    //
+    // Another option is to use the explicit API, i.e. what we do here. It
+    // involves more boilerplate, but it is a more reliable method.
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            // Input buffer (read only)
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // Output buffer
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // Items per worker uniform
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }
+        ],
+    });
+
+    // The pipeline layout is a way to specify multiple bind group layouts for a certain pipeline.
+    // This is not necessary when using the implicit API
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    // The compute pipeline. Describes which shader to run.
+    let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: Some(&pipeline_layout), // This is set to None when using implicit API
+        module: &cs_module,
+        entry_point: "main",
+    });
+
+
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &bind_group_layout,
