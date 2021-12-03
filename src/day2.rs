@@ -7,11 +7,15 @@
 // - Define a work size of 10
 // - Do not hardcode work size. Pass in work size as uniform? Use dimensions?
 
-use std::{borrow::Cow, num::NonZeroU32};
+use std::borrow::Cow;
 
 use wgpu::util::DeviceExt;
 
 use crate::utils::*;
+
+/// Each GPU worker will process this amount of items from the input.
+/// Since there are 1000 elements, we will spawn 100 GPU workers.
+const ITEMS_PER_WORKER: u32 = 10;
 
 /// The movement struct encodes the lines from the input
 /// #[repr(C)] is needed to make sure we get a consistent byte layout to send to GPU
@@ -91,23 +95,13 @@ async fn execute_gpu_inner(
     queue: &wgpu::Queue,
     input: &[Movement],
 ) -> Option<i32> {
-    let items_per_worker = 1;
-
     let cs_module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("day2.wgsl"))),
     });
 
-    let slice_size = input.len() * std::mem::size_of::<Movement>();
-    let size = slice_size as wgpu::BufferAddress;
-
-    // Used to read GPU results back into CPU
-    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    // The input buffer will have one Movement entry per input line.
+    let input_size = (input.len() * std::mem::size_of::<Movement>()) as wgpu::BufferAddress;
 
     // Used to store the problem input on the GPU and read it from the shader
     let input_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -118,14 +112,35 @@ async fn execute_gpu_inner(
             | wgpu::BufferUsages::COPY_SRC,
     });
 
-    // Used to store the problem input on the GPU and read it from the shader
+    // The output buffer stores the problem result. Each worker will compute a
+    // fraction of the output in parallel, and the final result will be
+    // aggregated on the CPU.
+    let output_size = (input.len() * std::mem::size_of::<Movement>() / ITEMS_PER_WORKER as usize)
+        as wgpu::BufferAddress;
     let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Output Buffer"),
-        size,
+        size: output_size,
         usage: wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
+    });
+
+    // Used to read GPU results back into CPU
+    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: output_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+
+    // This uniform buffer is just to send a single u32 value, with the
+    // ITEMS_PER_WORKER constant.
+    let items_per_worker_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Input Buffer"),
+        contents: bytemuck::cast_slice(&[ITEMS_PER_WORKER]),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
     // The compute pipeline. Describes which shader to run.
@@ -136,33 +151,18 @@ async fn execute_gpu_inner(
         entry_point: "main",
     });
 
-    // The bind group layout describes the compute shader inputs. Basically, our `storage_buffer`.
-    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: None,
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }, /*wgpu::BindGroupLayoutEntry {
-                   binding: 1,
-                   visibility: wgpu::ShaderStages::COMPUTE,
-                   ty: wgpu::BindingType::Buffer {
-                       ty: wgpu::BufferBindingType::Storage { read_only: false },
-                       has_dynamic_offset: false,
-                       min_binding_size: None,
-                   },
-                   count: None,
-               },*/
-        ],
-    });
-    //let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
-    dbg!(&bind_group_layout);
+    // This will introspect the shader code and generate an appropiate bind
+    // group layout automatically. The bind group layout can also be created
+    // manually, but then it needs to be kept in sync with the shader.
+    //
+    // There are a few caveats when using this implicit API, though:
+    //
+    // - It's more difficult to know what the bind group layout is, from Rust
+    //   alone. You need to look into the shaders.
+    // - The introspection does not look at declarations but *usages*. If a
+    //   storage buffer or uniform is unused in the shader code, the bind group
+    //   layout returned will be incorrect.
+    let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &bind_group_layout,
@@ -171,12 +171,14 @@ async fn execute_gpu_inner(
                 binding: 0,
                 resource: input_buffer.as_entire_binding(),
             },
-            /*
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: output_buffer.as_entire_binding(),
             },
-            */
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: items_per_worker_buffer.as_entire_binding(),
+            },
         ],
     });
 
@@ -192,18 +194,17 @@ async fn execute_gpu_inner(
         // This signals the GPU to run the compute operation. You also specify
         // the "compute space" layout. We get up to 3 dimensions, but just need
         // one so we use 1 for the remaining two
-        cpass.dispatch(input.len() as u32, 1, 1);
+        cpass.dispatch(input.len() as u32 / ITEMS_PER_WORKER, 1, 1);
     }
 
     // This tells the GPU to copy the buffer after the commpute shader is done.
-    encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, size);
+    encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size);
 
     // This is where things are finally run
     queue.submit(Some(encoder.finish()));
 
     // What remains, is waiting for the commands to finish executing on the GPU
     // and fetch the data from our staging buffer
-
     let buffer_slice = staging_buffer.slice(..);
     let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
 
@@ -211,12 +212,19 @@ async fn execute_gpu_inner(
 
     if let Ok(_) = buffer_future.await {
         let data = buffer_slice.get_mapped_range();
-        let result: Vec<Movement> = bytemuck::cast_slice(&data).to_vec();
+        let results: Vec<Movement> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging_buffer.unmap();
 
-        println!("{:?}", &result[0..10]);
-        Some(1)
+        println!("{:?}", &results[90..100]);
+
+        let mut acc = (0, 0);
+        for result in results {
+            acc.0 += result.dx;
+            acc.1 += result.dy;
+        }
+
+        Some(acc.0 * acc.1)
     } else {
         panic!("failed to run compute on gpu!")
     }
@@ -225,5 +233,5 @@ async fn execute_gpu_inner(
 #[test]
 fn main() {
     env_logger::init();
-    pollster::block_on(run());
+    println!("The number is {:?}", pollster::block_on(run()));
 }
